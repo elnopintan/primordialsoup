@@ -17,5 +17,6 @@
 #define TRACE_GROWTH true
 #define TRACE_PRIMITIVES false
 #define TRACE_SPECIAL_CONTROL false
+#define TRACE_CONCURRENT_MARK true
 
 #endif  // VM_FLAGS_H_

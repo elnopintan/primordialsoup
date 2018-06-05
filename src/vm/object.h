@@ -5,6 +5,8 @@
 #ifndef VM_OBJECT_H_
 #define VM_OBJECT_H_
 
+#include <atomic>
+
 #include "vm/assert.h"
 #include "vm/globals.h"
 #include "vm/bitfield.h"
@@ -34,7 +36,8 @@ enum ObjectAlignment {
 };
 
 enum HeaderBits {
-  // During a scavenge: Has this object been copied to to-space?
+  // New object: Already copied to to-space (is forwarding pointer).
+  // Old object: Already seen by the marker (is gray or black).
   kMarkBit = 0,
 
   // In remembered set.
@@ -186,23 +189,26 @@ class HeapObject : public Object {
   void set_is_marked(bool value) {
     ptr()->header_ = MarkBit::update(value, ptr()->header_);
   }
+  bool TryAcquireMarkBit() { return TryAcquireHeaderBit<MarkBit>(); }
+
   bool is_remembered() const {
-    return RememberedBit::decode(ptr()->header_);
+    return RememberedBit::decode(ptr()->header_.load(std::memory_order_relaxed));
   }
   void set_is_remembered(bool value) {
-    ptr()->header_ = RememberedBit::update(value, ptr()->header_);
+    UpdateHeaderBit<RememberedBit>(value);
   }
+
   bool is_canonical() const {
-    return CanonicalBit::decode(ptr()->header_);
+    return CanonicalBit::decode(ptr()->header_.load(std::memory_order_relaxed));
   }
   void set_is_canonical(bool value) {
     ptr()->header_ = CanonicalBit::update(value, ptr()->header_);
   }
   intptr_t heap_size() const {
-    return SizeField::decode(ptr()->header_) << kObjectAlignmentLog2;
+    return SizeField::decode(ptr()->header_.load(std::memory_order_relaxed)) << kObjectAlignmentLog2;
   }
   intptr_t cid() const {
-    return ClassIdField::decode(ptr()->header_);
+    return ClassIdField::decode(ptr()->header_.load(std::memory_order_relaxed));
   }
   void set_cid(intptr_t value) {
     ptr()->header_ = ClassIdField::update(value, ptr()->header_);
@@ -212,6 +218,24 @@ class HeapObject : public Object {
   }
   void set_header_hash(intptr_t value) {
     ptr()->header_hash_ = value;
+  }
+
+  template <class HeaderBitField>
+  void UpdateHeaderBit(bool value) {
+    if (value) {
+      ptr()->header_.fetch_or(HeaderBitField::encode(true),
+                              std::memory_order_relaxed);
+    } else {
+      ptr()->header_.fetch_and(~HeaderBitField::encode(true),
+                               std::memory_order_relaxed);
+    }
+  }
+
+  template <class HeaderBitField>
+  bool TryAcquireHeaderBit() {
+    uword previous = ptr()->header_.fetch_or(HeaderBitField::encode(true),
+                                             std::memory_order_relaxed);
+    return !HeaderBitField::decode(previous);
   }
 
   uword Addr() const {
@@ -254,24 +278,39 @@ class HeapObject : public Object {
   intptr_t HeapSizeFromClass() const;
   void Pointers(Object*** from, Object*** to);
 
+  static thread_local bool is_marking;  // TODO: Make callers pass in Heap*.
  protected:
   template<typename type>
   void StorePointer(type* addr, type value, Barrier barrier) {
     *addr = value;
     if (barrier == kNoBarrier) {
-      ASSERT(value->IsImmediateOrOldObject());
+      ASSERT(value->IsImmediateOrOldObject()); // Generational barrier
+      // TODO: Pre-mark nil and snapshot allocations to allow for verification.
+      // ASSERT(value->IsImmediate() || value->is_marked());  // Incremental barrier
     } else {
-      if (IsOldObject() && value->IsNewObject() && !is_remembered()) {
+      if (!IsOldObject()) return;
+
+      // Generational barrier.
+      if (value->IsNewObject() && !is_remembered()) {
         AddToRememberedSet();
+      }
+
+      // Incremental barrier.
+      if (value->IsOldObject() && is_marking) {
+        HeapObject* heap_value = static_cast<HeapObject*>(static_cast<Object*>(value));
+        if (heap_value->TryAcquireMarkBit()) {
+          heap_value->AddToMarkStack();
+        }
       }
     }
   }
 
-  uword header_;
+  std::atomic<uword> header_;
   uword header_hash_;
 
  private:
   void AddToRememberedSet() const;
+  void AddToMarkStack() const;
 
   const HeapObject* ptr() const {
     ASSERT(IsHeapObject());

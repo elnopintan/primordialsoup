@@ -48,6 +48,8 @@ class Isolate {
   void Interrupt();
   void PrintStack();
 
+  static ThreadPool* thread_pool() { return thread_pool_; }
+
  private:
   void Activate(Object* message, Object* port);
 

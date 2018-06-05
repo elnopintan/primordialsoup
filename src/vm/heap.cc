@@ -4,8 +4,11 @@
 
 #include "vm/heap.h"
 
+#include "vm/isolate.h"  // TODO: Move the thread pool.
+#include "vm/lockers.h"
 #include "vm/lookup_cache.h"
 #include "vm/os.h"
+#include "vm/thread_pool.h"
 
 namespace psoup {
 
@@ -54,27 +57,16 @@ class HeapPage {
   uword object_end_;
 };
 
-class MarkStack {
+class ConcurrentMarkTask : public ThreadPool::Task {
  public:
-  void Init(uword limit) {
-    top_ = &stack_[0];
-    end_ = reinterpret_cast<HeapObject**>(limit);
-  }
+  explicit ConcurrentMarkTask(Heap* heap) : heap_(heap) {}
 
-  bool IsEmpty() const { return top_ == &stack_[0]; }
-  void Push(HeapObject* obj) {
-    if (top_ == end_) {
-      FATAL("Mark stack overflow");
-    } else {
-      *top_++ = obj;
-    }
-  }
-  HeapObject* Pop() { return *--top_; }
+  virtual void Run() { heap_->ConcurrentMark(); }
 
  private:
-  HeapObject** top_;
-  HeapObject** end_;
-  HeapObject* stack_[];
+  Heap* const heap_;
+
+  DISALLOW_COPY_AND_ASSIGN(ConcurrentMarkTask);
 };
 
 Heap::Heap() :
@@ -128,9 +120,33 @@ Heap::Heap() :
   }
 #endif
   class_table_size_ = kFirstRegularObjectCid;
+
+  mutator_mark_block_ = new MarkBlock();
+  collector_mark_block_ = new MarkBlock();
+  shared_mark_block_ = NULL;
+
+  marking_monitor_ = new Monitor();
+  marking_state_ = kComplete;
+  concurrent_marked_ = 0;
+}
+
+static void DeleteMarkBlockList(MarkBlock* block) {
+  while (block != NULL) {
+    MarkBlock* next = block->next();
+    block->set_next(NULL);
+    block->Reset();
+    delete block;
+    block = next;
+  }
 }
 
 Heap::~Heap() {
+  WaitForMarker(); // TODO: Interrupt the marker.
+  DeleteMarkBlockList(mutator_mark_block_);
+  DeleteMarkBlockList(shared_mark_block_);
+  DeleteMarkBlockList(collector_mark_block_);
+  delete marking_monitor_;
+
   to_.Free();
   from_.Free();
   delete[] remembered_set_;
@@ -254,8 +270,12 @@ uword Heap::AllocateSnapshotLarge(intptr_t size) {
 }
 
 HeapPage* Heap::AllocatePage(intptr_t page_size, GrowthPolicy growth) {
-  if ((growth == kControlGrowth) && ((old_size_ + page_size) > old_limit_)) {
-    MarkSweep(kOldSpace);
+  if (growth == kControlGrowth) {
+    if ((old_size_ + page_size) > old_limit_) {
+      MarkSweep(kOldSpace);
+    } else {
+      EvaluateConcurrentMarking();
+    }
   }
   HeapPage* page = HeapPage::Allocate(page_size);
   old_capacity_ += page->size();
@@ -314,19 +334,14 @@ void Heap::Scavenge(Reason reason) {
   to_.ReadWrite();
 #endif
 
-  // Strong references.
+  // We treat all references as strong during a scavenge. WeakArray::next_ and
+  // Ephemeron::next_ may be in use by the concurrent marker.
   ScavengeRoots();
   uword scan = to_.object_start();
   while (scan < top_ || end_ < to_.limit()) {
     scan = ScavengeToSpace(scan);
     ProcessTenureStack();
-    ScavengeEphemeronList();
   }
-
-  // Weak references.
-  MournEphemeronList();
-  MournWeakListScavenge();
-  MournClassTableScavenge();
 
 #if defined(DEBUG)
   from_.MarkUnallocated();
@@ -365,8 +380,12 @@ void Heap::Scavenge(Reason reason) {
          reason == kSnapshotTest);
   // kClassTable and kPrimitive will follow up with a MarkSweep anyway, so don't
   // perform an extra one for tenure.
-  if ((reason == kNewSpace) && (old_size_ > old_limit_)) {
-    MarkSweep(kTenure);
+  if (reason == kNewSpace) {
+    if (old_size_ > old_limit_) {
+      MarkSweep(kTenure);
+    } else {
+      EvaluateConcurrentMarking();
+    }
   }
 }
 
@@ -424,6 +443,9 @@ void Heap::ScavengeRoots() {
 
   for (intptr_t i = 0; i < saved_remembered_set_size; i++) {
     HeapObject* obj = remembered_set_[i];
+    if (obj == NULL) {
+      continue;
+    }
     ASSERT(obj->IsOldObject());
     ASSERT(obj->is_remembered());
     obj->set_is_remembered(false);
@@ -436,24 +458,20 @@ void Heap::ScavengeRoots() {
   for (intptr_t i = 0; i < handles_size_; i++) {
     ScavengePointer(handles_[i]);
   }
+
+  for (intptr_t i = kFirstLegalCid; i < class_table_size_; i++) {
+    ScavengePointer(&class_table_[i]);
+  }
 }
 
 uword Heap::ScavengeToSpace(uword scan) {
   while (scan < top_) {
     HeapObject* obj = HeapObject::FromAddr(scan);
-    intptr_t cid = obj->cid();
-    ScavengeClass(cid);
-    if (cid == kWeakArrayCid) {
-      AddToWeakList(static_cast<WeakArray*>(obj));
-    } else if (cid == kEphemeronCid) {
-      AddToEphemeronList(static_cast<Ephemeron*>(obj));
-    } else {
-      Object** from;
-      Object** to;
-      obj->Pointers(&from, &to);
-      for (Object** ptr = from; ptr <= to; ptr++) {
-        ScavengePointer(ptr);
-      }
+    Object** from;
+    Object** to;
+    obj->Pointers(&from, &to);
+    for (Object** ptr = from; ptr <= to; ptr++) {
+      ScavengePointer(ptr);
     }
     scan += obj->HeapSize();
   }
@@ -485,6 +503,12 @@ void Heap::ProcessTenureStack() {
   while (!IsTenureStackEmpty()) {
     HeapObject* obj = HeapObject::FromAddr(PopTenureStack());
     ScavengeOldObject(obj);
+
+    // See ForwardPointer.
+    if (marking_state_ != kComplete) {
+      ASSERT(obj->is_marked());
+      AddToMarkStack(obj);
+    }
   }
 }
 
@@ -537,6 +561,16 @@ void Heap::ScavengePointer(Object** ptr) {
            reinterpret_cast<void*>(old_target->Addr()),
            size);
     new_target = HeapObject::FromAddr(new_target_addr);
+
+    if (new_target->IsOldObject() && (marking_state_ != kComplete)) {
+      // Setting the forwarding pointer below will make this tenured object
+      // visible to the concurrent marker, but we haven't visited its slots yet.
+      // We mark the object here so the concurrent marker won't add it to the
+      // mark stack and visit its slots. We'll push it to the mark stack after
+      // forwarding its slots in ProcessTenureStack.
+      new_target->set_is_marked(true);  // TODO: order_relaxed
+    }
+
     SetForwarded(old_target, new_target);
   }
 
@@ -546,99 +580,139 @@ void Heap::ScavengePointer(Object** ptr) {
 }
 
 void Heap::ScavengeOldObject(HeapObject* obj) {
-  intptr_t cid = obj->cid();
-  ScavengeClass(cid);
-  if (cid == kWeakArrayCid) {
-    AddToWeakList(static_cast<WeakArray*>(obj));
-  } else if (cid == kEphemeronCid) {
-    AddToEphemeronList(static_cast<Ephemeron*>(obj));
-  } else {
-    Object** from;
-    Object** to;
-    obj->Pointers(&from, &to);
-    for (Object** ptr = from; ptr <= to; ptr++) {
-      ScavengePointer(ptr);
-      if ((*ptr)->IsNewObject() && !obj->is_remembered()) {
-        AddToRememberedSet(obj);
-      }
+  Object** from;
+  Object** to;
+  obj->Pointers(&from, &to);
+  for (Object** ptr = from; ptr <= to; ptr++) {
+    ScavengePointer(ptr);
+    if ((*ptr)->IsNewObject() && !obj->is_remembered()) {
+      AddToRememberedSet(obj);
     }
   }
 }
 
-void Heap::ScavengeClass(intptr_t cid) {
-  ASSERT(cid < class_table_size_);
-  // This is very similar to ScavengePointer.
-
-  HeapObject* old_target = static_cast<HeapObject*>(class_table_[cid]);
-  if (old_target->IsImmediateOrOldObject()) {
-    return;
+void Heap::EvaluateConcurrentMarking() {
+  MarkingState state;
+  {
+    MonitorLocker ml(marking_monitor_);
+    state = marking_state_;
   }
 
-  DEBUG_ASSERT(InFromSpace(old_target));
-
-  if (IsForwarded(old_target)) {
-    // Already scavenged.
-    return;
+  if (state == kAwaitingFinalization) {
+#if TRACE_CONCURRENT_MARK
+    OS::PrintErr("Finalizing marking\n");
+#endif
+    MarkSweep(kFinalize);
+  } else if ((state == kComplete) && (old_size_ + to_.size()/2 > old_limit_)) {
+#if TRACE_CONCURRENT_MARK
+    OS::PrintErr("Begin concurrent marking\n");
+#endif
+    bool visit_weak = false;
+    MarkRoots(visit_weak);
+    marking_state_ = kMarking;
+    HeapObject::is_marking = true;  // Enable write barrier.
+    Isolate::thread_pool()->Run(new ConcurrentMarkTask(this));
   }
-
-  // Target is now known to be reachable. Move it to to-space.
-  intptr_t size = old_target->HeapSize();
-
-  uword new_target_addr;
-  if (old_target->Addr() < survivor_end_) {
-    new_target_addr = AllocateTenure(size);
-  } else {
-    new_target_addr = TryAllocateNew(size);
-  }
-
-  ASSERT(new_target_addr != 0);
-  memcpy(reinterpret_cast<void*>(new_target_addr),
-         reinterpret_cast<void*>(old_target->Addr()),
-         size);
-  HeapObject* new_target = HeapObject::FromAddr(new_target_addr);
-  SetForwarded(old_target, new_target);
 }
 
-void Heap::MarkSweep(Reason reason) {
-#if REPORT_GC
+void Heap::ConcurrentMark() {
+  ASSERT(marking_state_ == kMarking);
+#if TRACE_CONCURRENT_MARK
   int64_t start = OS::CurrentMonotonicNanos();
-  size_t size_before = old_size_;
 #endif
 
-#if defined(DEBUG)
-  from_.ReadWrite();
-#endif
-
-  MarkStack* mark_stack = reinterpret_cast<MarkStack*>(from_.base());
-  mark_stack->Init(from_.limit());
-
-  // Remembered set will be re-built during marking.
-  remembered_set_size_ = 0;
-  old_size_ = 0;
-
-  // Strong references.
-  MarkRoots();
-  while (!mark_stack->IsEmpty()) {
-    ProcessMarkStack();
+  size_t marked = 0;
+  while (!collector_mark_block_->IsEmpty() ||
+         collector_mark_block_->next() != NULL) {
+    marked += ProcessMarkStack();
     MarkEphemeronList();
   }
 
-#if defined(DEBUG)
-  from_.NoAccess();
+#if TRACE_CONCURRENT_MARK
+  int64_t stop = OS::CurrentMonotonicNanos();
+  OS::PrintErr("CON marked %" Pd " kB in %" Pd64 "us\n", marked / KB,
+               (stop - start) / kNanosecondsPerMicrosecond);
 #endif
 
+  concurrent_marked_ = marked;
+
+  MonitorLocker ml(marking_monitor_);
+  marking_state_ = kAwaitingFinalization;
+  ml.Notify();
+}
+
+void Heap::WaitForMarker() {
+  MonitorLocker ml(marking_monitor_);
+  while (marking_state_ == kMarking) {
+    ml.Wait();
+  }
+}
+
+void Heap::CollectAll(Reason reason) {
+  // TODO: Instead interrupt the marker, abandon the mark stack, and reset the
+  // mark bits.
+  MarkSweep(kFinalize);
+
+  survivor_end_ = end_;  // Tenure everything.
+  Scavenge(reason);
+  MarkSweep(reason);
+}
+
+void Heap::MarkSweep(Reason reason) {
+  int64_t start = OS::CurrentMonotonicNanos();
+#if REPORT_GC
+  size_t size_before = old_size_;
+#endif
+
+  WaitForMarker();
+
+  // Move all marking blocks over to the collector's linked list.
+  MutatorReleaseBlock();
+  collector_mark_block_->set_next(shared_mark_block_);
+  shared_mark_block_ = NULL;
+
+  // Explicitly mark nil since we skip the barrier for various initializing
+  // stores.
+  MarkObject(object_store()->nil_obj());
+
+  // Strong references.
+  MarkRoots(true);
+  size_t stw_marked = 0;
+  while (!collector_mark_block_->IsEmpty() ||
+         collector_mark_block_->next() != NULL) {
+    stw_marked += ProcessMarkStack();
+    MarkEphemeronList();
+  }
+
+  ASSERT(collector_mark_block_ != NULL);
+  ASSERT(collector_mark_block_->IsEmpty());
+  ASSERT(mutator_mark_block_ != NULL);
+  ASSERT(mutator_mark_block_->IsEmpty());
+  ASSERT(shared_mark_block_.load() == NULL);
+
+  marking_state_ = kComplete;
+  HeapObject::is_marking = false;  // Disable write barrier.
+
+  ASSERT((stw_marked + concurrent_marked_) <= old_size_);
+  old_size_ = stw_marked + concurrent_marked_;
   ASSERT(old_size_ <= old_capacity_);
+  concurrent_marked_ = 0;
+
+#if TRACE_CONCURRENT_MARK
+  int64_t mid = OS::CurrentMonotonicNanos();
+  OS::PrintErr("STW marked %" Pd " kB in %" Pd64 "us\n", stw_marked / KB,
+               (mid - start) / kNanosecondsPerMicrosecond);
+#endif
 
   // Weak references.
   MournEphemeronList();
   MournWeakListMarkSweep();
   MournClassTableMarkSweep();
+  MournRememberedSet();
 
   ClearCaches();
 
-  Sweep();
-
-  ShrinkRememberedSet();
+  Sweep();  // TODO: Concurrent sweep.
 
   SetOldAllocationLimit();
 
@@ -654,7 +728,7 @@ void Heap::MarkSweep(Reason reason) {
 #endif
 }
 
-void Heap::MarkRoots() {
+void Heap::MarkRoots(bool visit_weak) {
   MarkObject(object_store_);
   MarkObject(current_activation_);
 
@@ -676,9 +750,13 @@ void Heap::MarkRoots() {
       MarkObject(ClassAt(cid));
 
       if (cid == kWeakArrayCid) {
-        AddToWeakList(static_cast<WeakArray*>(obj));
+        if (visit_weak) {
+          AddToWeakList(static_cast<WeakArray*>(obj));
+        }
       } else if (cid == kEphemeronCid) {
-        AddToEphemeronList(static_cast<Ephemeron*>(obj));
+        if (visit_weak) {
+          AddToEphemeronList(static_cast<Ephemeron*>(obj));
+        }
       } else {
         Object** from;
         Object** to;
@@ -696,27 +774,32 @@ void Heap::MarkObject(Object* obj) {
   if (obj->IsImmediateOrNewObject()) return;
 
   HeapObject* heap_obj = static_cast<HeapObject*>(obj);
-  if (heap_obj->is_marked()) return;
+  if (!heap_obj->TryAcquireMarkBit()) return;
 
-  heap_obj->set_is_marked(true);
-  heap_obj->set_is_remembered(false);
-  MarkStack* mark_stack = reinterpret_cast<MarkStack*>(from_.base());
-  mark_stack->Push(heap_obj);
+  if (collector_mark_block_->Push(heap_obj)) {
+    return;
+  }
+  MarkBlock* new_block = new MarkBlock();
+  new_block->set_next(collector_mark_block_);
+  collector_mark_block_ = new_block;
+  bool success = collector_mark_block_->Push(heap_obj);
+  ASSERT(success);
 }
 
-void Heap::ProcessMarkStack() {
-  MarkStack* mark_stack = reinterpret_cast<MarkStack*>(from_.base());
-  while (!mark_stack->IsEmpty()) {
-    HeapObject* obj = mark_stack->Pop();
+size_t Heap::ProcessMarkStack() {
+  size_t marked = 0;
+ again:
+  while (!collector_mark_block_->IsEmpty()) {
+    HeapObject* obj = collector_mark_block_->Pop();
+    ASSERT(obj->IsOldObject());
     ASSERT(obj->is_marked());
-    ASSERT(!obj->is_remembered());
 
     intptr_t cid = obj->cid();
     ASSERT(cid != kIllegalCid);
     ASSERT(cid != kForwardingCorpseCid);
     ASSERT(cid != kFreeListElementCid);
 
-    old_size_ += obj->HeapSize();
+    marked += obj->HeapSize();
 
     MarkObject(ClassAt(cid));
 
@@ -731,13 +814,26 @@ void Heap::ProcessMarkStack() {
       for (Object** ptr = from; ptr <= to; ptr++) {
         Object* target = *ptr;
         MarkObject(target);
-        ASSERT(obj->IsOldObject());
-        if (target->IsNewObject() && !obj->is_remembered()) {
-          AddToRememberedSet(obj);
-        }
       }
     }
   }
+
+  MarkBlock* next = collector_mark_block_->next();
+  if (next != NULL) {
+    collector_mark_block_->set_next(NULL);
+    delete collector_mark_block_;
+    collector_mark_block_ = next;
+    goto again;
+  }
+  next = shared_mark_block_.exchange(NULL, std::memory_order_acquire);
+  if (next != NULL) {
+    collector_mark_block_->set_next(NULL);
+    delete collector_mark_block_;
+    collector_mark_block_ = next;
+    goto again;
+  }
+
+  return marked;
 }
 
 void Heap::Sweep() {
@@ -810,42 +906,6 @@ void Heap::AddToEphemeronList(Ephemeron* survivor) {
   ephemeron_list_ = survivor;
 }
 
-static bool IsScavengeSurvivor(Object* obj) {
-  return obj->IsImmediateOrOldObject() ||
-      IsForwarded(static_cast<HeapObject*>(obj));
-}
-
-void Heap::ScavengeEphemeronList() {
-  Ephemeron* survivor = ephemeron_list_;
-  ephemeron_list_ = NULL;
-
-  while (survivor != NULL) {
-    ASSERT(survivor->IsEphemeron());
-    Ephemeron* next = survivor->next();
-    survivor->set_next(NULL);
-
-    if (IsScavengeSurvivor(survivor->key())) {
-      ScavengePointer(survivor->key_ptr());
-      ScavengePointer(survivor->value_ptr());
-      ScavengePointer(survivor->finalizer_ptr());
-
-      if (survivor->IsOldObject() &&
-          (survivor->key()->IsNewObject() ||
-           survivor->value()->IsNewObject() ||
-           survivor->finalizer()->IsNewObject()) &&
-          !survivor->is_remembered()) {
-        AddToRememberedSet(survivor);
-      }
-    } else {
-      // Fate of key is not yet known, return the ephemeron to list.
-      survivor->set_next(ephemeron_list_);
-      ephemeron_list_ = survivor;
-    }
-
-    survivor = next;
-  }
-}
-
 static bool IsMarkSweepSurvivor(Object* obj) {
   return obj->IsImmediateOrNewObject() ||
       static_cast<HeapObject*>(obj)->is_marked();
@@ -867,14 +927,6 @@ void Heap::MarkEphemeronList() {
       MarkObject(survivor->key());
       MarkObject(survivor->value());
       MarkObject(survivor->finalizer());
-
-      if (survivor->IsOldObject() &&
-          (survivor->key()->IsNewObject() ||
-           survivor->value()->IsNewObject() ||
-           survivor->finalizer()->IsNewObject()) &&
-          !survivor->is_remembered()) {
-        AddToRememberedSet(survivor);
-      }
     } else {
       // Fate of the key is not yet known; add the ephemeron back to the list.
       survivor->set_next(ephemeron_list_);
@@ -913,31 +965,6 @@ void Heap::AddToWeakList(WeakArray* survivor) {
   weak_list_ = survivor;
 }
 
-void Heap::MournWeakListScavenge() {
-  WeakArray* survivor = weak_list_;
-  weak_list_ = NULL;
-  while (survivor != NULL) {
-    ASSERT(survivor->IsWeakArray());
-
-    Object** from;
-    Object** to;
-    survivor->Pointers(&from, &to);
-    for (Object** ptr = from; ptr <= to; ptr++) {
-      MournWeakPointerScavenge(ptr);
-      if (survivor->IsOldObject() &&
-          (*ptr)->IsNewObject() &&
-          !survivor->is_remembered()) {
-        AddToRememberedSet(survivor);
-      }
-    }
-
-    WeakArray* next = survivor->next();
-    survivor->set_next(NULL);
-    survivor = next;
-  }
-  ASSERT(weak_list_ == NULL);
-}
-
 void Heap::MournWeakListMarkSweep() {
   WeakArray* survivor = weak_list_;
   weak_list_ = NULL;
@@ -952,6 +979,7 @@ void Heap::MournWeakListMarkSweep() {
       if (survivor->IsOldObject() &&
           (*ptr)->IsNewObject() &&
           !survivor->is_remembered()) {
+        UNREACHABLE();
         AddToRememberedSet(survivor);
       }
     }
@@ -963,29 +991,6 @@ void Heap::MournWeakListMarkSweep() {
   ASSERT(weak_list_ == NULL);
 }
 
-
-void Heap::MournWeakPointerScavenge(Object** ptr) {
-  HeapObject* old_target = static_cast<HeapObject*>(*ptr);
-  if (old_target->IsImmediateOrOldObject()) {
-    return;
-  }
-
-  DEBUG_ASSERT(InFromSpace(old_target));
-
-  HeapObject* new_target;
-  if (IsForwarded(old_target)) {
-    new_target = ForwardingTarget(old_target);
-  } else {
-    // The object store and nil have already been scavenged.
-    new_target = static_cast<HeapObject*>(object_store()->nil_obj());
-  }
-
-  DEBUG_ASSERT(new_target->IsOldObject() || InToSpace(new_target));
-
-  *ptr = new_target;
-}
-
-
 void Heap::MournWeakPointerMarkSweep(Object** ptr) {
   Object* target = *ptr;
 
@@ -996,28 +1001,6 @@ void Heap::MournWeakPointerMarkSweep(Object** ptr) {
 
   ASSERT(IsMarkSweepSurvivor(object_store()->nil_obj()));
   *ptr = object_store()->nil_obj();
-}
-
-void Heap::MournClassTableScavenge() {
-  for (intptr_t i = kFirstLegalCid; i < class_table_size_; i++) {
-    Object** ptr = &class_table_[i];
-
-    HeapObject* old_target = static_cast<HeapObject*>(*ptr);
-    if (old_target->IsImmediateOrOldObject()) {
-      continue;
-    }
-
-    DEBUG_ASSERT(InFromSpace(old_target));
-
-    if (IsForwarded(old_target)) {
-      HeapObject* new_target = ForwardingTarget(old_target);
-      DEBUG_ASSERT(new_target->IsOldObject() || InToSpace(new_target));
-      *ptr = new_target;
-    } else {
-      *ptr = SmallInteger::New(class_table_free_);
-      class_table_free_ = i;
-    }
-  }
 }
 
 void Heap::MournClassTableMarkSweep() {
@@ -1032,6 +1015,20 @@ void Heap::MournClassTableMarkSweep() {
 
     *ptr = SmallInteger::New(class_table_free_);
     class_table_free_ = i;
+  }
+}
+
+void Heap::MournRememberedSet() {
+  for (intptr_t i = 0; i < remembered_set_size_; i++) {
+    HeapObject* obj = remembered_set_[i];
+    if (obj == NULL) {
+      continue;
+    }
+    ASSERT(obj->IsOldObject());
+    ASSERT(obj->is_remembered());
+    if (!obj->is_marked()) {
+      remembered_set_[i] = NULL;
+    }
   }
 }
 
@@ -1052,6 +1049,13 @@ bool Heap::BecomeForward(Array* old, Array* neu) {
         forwardee->IsImmediateObject()) {
       return false;
     }
+  }
+
+  // TODO: It should be safe to let the marker continue if we apply the write
+  // barrier during forwarding.
+  WaitForMarker();
+  if (marking_state_ == kAwaitingFinalization) {
+    MarkSweep(kFinalize);
   }
 
   for (intptr_t i = 0; i < length; i++) {

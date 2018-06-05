@@ -114,6 +114,14 @@ void HeapObject::AddToRememberedSet() const {
 }
 
 
+thread_local bool HeapObject::is_marking = false;
+void HeapObject::AddToMarkStack() const {
+  Isolate* isolate = Isolate::Current();
+  ASSERT(isolate != NULL);
+  isolate->heap()->AddToMarkStack(const_cast<HeapObject*>(this));
+}
+
+
 char* Object::ToCString(Heap* heap) const {
   char* result = NULL;
   intptr_t length;

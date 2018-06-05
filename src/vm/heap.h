@@ -16,6 +16,7 @@ namespace psoup {
 
 class HeapPage;
 class LookupCache;
+class Monitor;
 
 // Note these values are never valid Object*.
 #if defined(ARCH_IS_32_BIT)
@@ -98,6 +99,44 @@ class FreeList {
   FreeListElement* free_lists_[kSizeClasses + 1];
 };
 
+class MarkBlock {
+  static const intptr_t kSize = 128 - 2;
+
+ public:
+  MarkBlock() : next_(NULL), top_(&objects_[0]) {}
+
+  ~MarkBlock() {
+    ASSERT(IsEmpty() && (next_ == NULL));
+  }
+
+  bool IsEmpty() const { return top_ == &objects_[0]; }
+  void Reset() { top_ = &objects_[0]; }
+
+  bool Push(HeapObject* object) {
+    if (top_ < &objects_[kSize]) {
+      *top_++ = object;
+      return true;
+    }
+    return false;
+  }
+
+  HeapObject* Pop() {
+    ASSERT(!IsEmpty());
+    return *--top_;
+  }
+
+  HeapObject** base() { return &objects_[0]; }
+  HeapObject** top() { return top_; }
+
+  MarkBlock* next() const { return next_; }
+  void set_next(MarkBlock* next) { next_ = next; }
+
+ private:
+  MarkBlock* next_;
+  HeapObject** top_;
+  HeapObject* objects_[kSize];
+};
+
 // C. J. Cheney. "A nonrecursive list compacting algorithm." Communications of
 // the ACM. 1970.
 //
@@ -121,7 +160,9 @@ class Heap {
     kOldSpace,
     kClassTable,
     kPrimitive,
-    kSnapshotTest
+    kSnapshotTest,
+
+    kFinalize,
   };
 
   static const char* ReasonToCString(Reason reason) {
@@ -132,6 +173,7 @@ class Heap {
       case kClassTable: return "class-table";
       case kPrimitive: return "primitive";
       case kSnapshotTest: return "snapshot-test";
+      case kFinalize: return "finalize";
     }
     UNREACHABLE();
     return NULL;
@@ -150,6 +192,18 @@ class Heap {
     object->set_is_remembered(true);
   }
 
+  void AddToMarkStack(HeapObject* object) {
+    ASSERT(object->is_marked());
+    if (mutator_mark_block_->Push(object)) {
+      return;
+    }
+
+    MutatorReleaseBlock();
+
+    bool success = mutator_mark_block_->Push(object);
+    ASSERT(success);
+  }
+
   RegularObject* AllocateRegularObject(intptr_t cid, intptr_t num_slots,
                                        Allocator allocator = kNormal) {
     ASSERT(cid == kEphemeronCid || cid >= kFirstRegularObjectCid);
@@ -164,7 +218,7 @@ class Heap {
     const intptr_t header_slots = sizeof(HeapObject) / sizeof(uword);
     if (((header_slots + num_slots) & 1) == 1) {
       // The leftover slot will be visited by the GC. Make it a valid oop.
-      result->set_slot(num_slots, SmallInteger::New(0));
+      result->set_slot(num_slots, SmallInteger::New(0), kNoBarrier);
     }
 
     return result;
@@ -317,11 +371,7 @@ class Heap {
 
   void PrintStack();
 
-  void CollectAll(Reason reason) {
-    survivor_end_ = end_;  // Tenure everything.
-    Scavenge(reason);
-    MarkSweep(reason);
-  }
+  void CollectAll(Reason reason);
 
   intptr_t CountInstances(intptr_t cid);
   intptr_t CollectInstances(intptr_t cid, Array* array);
@@ -386,29 +436,29 @@ class Heap {
   void ScavengeClass(intptr_t cid);
 
   // Mark-sweep.
+  void EvaluateConcurrentMarking();
+  void ConcurrentMark();
+  void WaitForMarker();
   void MarkSweep(Reason reason);
-  void MarkRoots();
+  void MarkRoots(bool visit_weak);
   void MarkObject(Object* obj);
-  void ProcessMarkStack();
+  size_t ProcessMarkStack();
   void Sweep();
   bool SweepPage(HeapPage* page);
   void SetOldAllocationLimit();
+  void MournRememberedSet();
 
   // Ephemerons.
   void AddToEphemeronList(Ephemeron* ephemeron_corpse);
-  void ScavengeEphemeronList();
   void MarkEphemeronList();
   void MournEphemeronList();
 
   // WeakArrays.
   void AddToWeakList(WeakArray* survivor);
-  void MournWeakListScavenge();
   void MournWeakListMarkSweep();
-  void MournWeakPointerScavenge(Object** ptr);
   void MournWeakPointerMarkSweep(Object** ptr);
 
   // Weak class table.
-  void MournClassTableScavenge();
   void MournClassTableMarkSweep();
 
   // Become.
@@ -461,6 +511,30 @@ class Heap {
   }
 #endif
 
+  void MutatorReleaseBlock() {
+    MarkBlock* mutator = mutator_mark_block_;
+    MarkBlock* shared = shared_mark_block_;
+    do {
+      mutator->set_next(shared);
+    } while (!shared_mark_block_.compare_exchange_weak(shared, mutator,
+                                                       std::memory_order_release));
+
+    mutator_mark_block_ = new MarkBlock();
+  }
+
+  MarkBlock* mutator_mark_block_;
+  MarkBlock* collector_mark_block_;
+  std::atomic<MarkBlock*> shared_mark_block_;
+
+  Monitor* marking_monitor_;
+  enum MarkingState {
+    kComplete,
+    kMarking,
+    kAwaitingFinalization,
+  };
+  MarkingState marking_state_;
+  size_t concurrent_marked_;
+
   // New space.
   uword top_;
   uword end_;
@@ -507,6 +581,8 @@ class Heap {
   WeakArray* weak_list_;
 
   DISALLOW_COPY_AND_ASSIGN(Heap);
+
+ friend class ConcurrentMarkTask;
 };
 
 
